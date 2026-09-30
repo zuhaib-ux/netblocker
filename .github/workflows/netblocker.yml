@@ -1,0 +1,680 @@
+# Net Blocker - builds an Android APK from the code below.
+# Upload this file to .github/workflows/ in your GitHub repository.
+# Every time it changes, GitHub builds a new NetBlocker.apk and puts it under "Releases".
+
+name: Build Net Blocker APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the project files
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF_APPLOCK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.myapps.netblocker"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.myapps.netblocker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              // Fixed signing key, so future builds install as updates
+              // (no need to uninstall and set up again).
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("netblocker.jks")
+                      storePassword = "netblock123"
+                      keyAlias = "netblocker"
+                      keyPassword = "netblock123"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BlockerService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/netblocker/BlockerService.kt')"
+          cat > 'app/src/main/java/com/myapps/netblocker/BlockerService.kt' <<'EOF_APPLOCK'
+          package com.myapps.netblocker
+
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import android.net.NetworkRequest
+          import android.net.VpnService
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+
+          /**
+           * A local "VPN" that never leaves the phone. Only the blocked apps are sent
+           * into it, and everything they send is thrown away, so they have no internet.
+           * All other apps don't touch it and work normally.
+           */
+          class BlockerService : VpnService() {
+
+              companion object {
+                  const val ACTION_START = "com.myapps.netblocker.START"
+                  const val ACTION_STOP = "com.myapps.netblocker.STOP"
+                  const val ACTION_RELOAD = "com.myapps.netblocker.RELOAD"
+
+                  @Volatile
+                  var running = false
+              }
+
+              @Volatile
+              private var iface: ParcelFileDescriptor? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var callback: ConnectivityManager.NetworkCallback? = null
+              private val wifiNetworks = HashMap<Network, Boolean>()
+              private var onWifi: Boolean? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      shutdown()
+                      return START_NOT_STICKY
+                  }
+                  // START, RELOAD, or started by Android's "Always-on VPN" setting.
+                  if (callback == null) watchNetworks()
+                  rebuild()
+                  return START_STICKY
+              }
+
+              override fun onRevoke() {
+                  // The user turned the VPN off in Settings, or another VPN app took over.
+                  shutdown()
+              }
+
+              override fun onDestroy() {
+                  cleanup()
+                  super.onDestroy()
+              }
+
+              /** Follows WiFi on/off so the right block list is used. */
+              private fun watchNetworks() {
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val cb = object : ConnectivityManager.NetworkCallback() {
+                      override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                          wifiNetworks[network] = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                              caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                          checkNetwork()
+                      }
+
+                      override fun onLost(network: Network) {
+                          wifiNetworks.remove(network)
+                          checkNetwork()
+                      }
+                  }
+                  val request = NetworkRequest.Builder()
+                      .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                      .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                      .build()
+                  cm.registerNetworkCallback(request, cb, handler)
+                  callback = cb
+              }
+
+              private fun checkNetwork() {
+                  val wifi = wifiNetworks.values.any { it }
+                  if (wifi != onWifi) {
+                      onWifi = wifi
+                      rebuild()
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun currentlyOnWifi(): Boolean {
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  return cm.allNetworks.any { n ->
+                      val caps = cm.getNetworkCapabilities(n) ?: return@any false
+                      caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                          !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                          caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                  }
+              }
+
+              private fun rebuild() {
+                  val wifi = onWifi ?: currentlyOnWifi().also { onWifi = it }
+                  val blocked = Prefs.blocked(this, wifi)
+
+                  val builder = Builder()
+                      .setSession(if (wifi) "Blocking on WiFi" else "Blocking on mobile data")
+                      .setMtu(1500)
+                      .addAddress("10.111.222.1", 32)
+                      .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
+                      .addRoute("0.0.0.0", 0)
+                      .addRoute("::", 0)
+
+                  // This app itself is always in the list. That keeps the list from ever
+                  // being empty, because an empty list would block EVERY app.
+                  builder.addAllowedApplication(packageName)
+                  for (p in blocked) {
+                      try {
+                          builder.addAllowedApplication(p)
+                      } catch (e: PackageManager.NameNotFoundException) {
+                          // App was uninstalled - skip it.
+                      }
+                  }
+
+                  val newIface = try {
+                      builder.establish()
+                  } catch (e: Exception) {
+                      null
+                  }
+                  val old = iface
+                  iface = newIface
+                  try {
+                      old?.close()
+                  } catch (e: Exception) {
+                  }
+                  running = newIface != null
+                  if (newIface != null) drain(newIface)
+              }
+
+              /** Reads and throws away everything the blocked apps try to send. */
+              private fun drain(pfd: ParcelFileDescriptor) {
+                  val t = Thread {
+                      val input = FileInputStream(pfd.fileDescriptor)
+                      val buf = ByteArray(32767)
+                      while (iface === pfd) {
+                          val n = try {
+                              input.read(buf)
+                          } catch (e: Exception) {
+                              0
+                          }
+                          if (n <= 0) {
+                              try {
+                                  Thread.sleep(100)
+                              } catch (e: InterruptedException) {
+                                  break
+                              }
+                          }
+                      }
+                  }
+                  t.isDaemon = true
+                  t.start()
+              }
+
+              private fun cleanup() {
+                  callback?.let {
+                      try {
+                          getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  callback = null
+                  val old = iface
+                  iface = null
+                  try {
+                      old?.close()
+                  } catch (e: Exception) {
+                  }
+                  running = false
+              }
+
+              private fun shutdown() {
+                  cleanup()
+                  stopSelf()
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/netblocker/MainActivity.kt')"
+          cat > 'app/src/main/java/com/myapps/netblocker/MainActivity.kt' <<'EOF_APPLOCK'
+          package com.myapps.netblocker
+
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.Drawable
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              companion object {
+                  private const val REQ_VPN = 1
+              }
+
+              data class AppItem(val pkg: String, val label: String)
+
+              private var allApps: List<AppItem> = emptyList()
+              private var shown: List<AppItem> = emptyList()
+              private var query = ""
+              private lateinit var status: TextView
+              private lateinit var toggle: Button
+              private val adapter = AppAdapter()
+              private val handler = Handler(Looper.getMainLooper())
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.addView(buildHeader())
+                  val list = ListView(this)
+                  list.adapter = adapter
+                  root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  setContentView(root)
+                  loadApps()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val on = BlockerService.running
+                  status.text = if (on) "🛡️ Blocker is ON" else "Blocker is OFF"
+                  toggle.text = if (on) "Stop blocker" else "Start blocker"
+              }
+
+              private fun buildHeader(): View {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(dp(16), dp(12), dp(16), dp(4))
+
+                  status = TextView(this)
+                  status.textSize = 18f
+                  box.addView(status)
+
+                  toggle = Button(this)
+                  toggle.isAllCaps = false
+                  toggle.setOnClickListener { onToggle() }
+                  box.addView(toggle)
+
+                  val help = TextView(this)
+                  help.text = "Tick WiFi to block an app on WiFi. Tick Data to block it on mobile data."
+                  help.setPadding(0, dp(8), 0, dp(4))
+                  box.addView(help)
+
+                  val search = EditText(this)
+                  search.hint = "Search apps"
+                  search.isSingleLine = true
+                  search.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          query = s?.toString().orEmpty()
+                          applyFilter()
+                      }
+                  })
+                  box.addView(search, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  return box
+              }
+
+              private fun onToggle() {
+                  if (BlockerService.running) {
+                      startService(Intent(this, BlockerService::class.java).setAction(BlockerService.ACTION_STOP))
+                      handler.postDelayed({ refresh() }, 600)
+                      return
+                  }
+                  val consent = VpnService.prepare(this)
+                  if (consent != null) {
+                      @Suppress("DEPRECATION")
+                      startActivityForResult(consent, REQ_VPN)
+                  } else {
+                      startBlocker()
+                  }
+              }
+
+              @Deprecated("Simple result handling")
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_VPN && resultCode == RESULT_OK) startBlocker()
+              }
+
+              private fun startBlocker() {
+                  startService(Intent(this, BlockerService::class.java).setAction(BlockerService.ACTION_START))
+                  handler.postDelayed({ refresh() }, 600)
+              }
+
+              private fun setBlocked(pkg: String, wifi: Boolean, block: Boolean) {
+                  Prefs.setBlocked(this, wifi, pkg, block)
+                  if (BlockerService.running) {
+                      startService(Intent(this, BlockerService::class.java).setAction(BlockerService.ACTION_RELOAD))
+                  }
+              }
+
+              private fun applyFilter() {
+                  val q = query.trim()
+                  shown = if (q.isEmpty()) allApps else allApps.filter { it.label.contains(q, ignoreCase = true) }
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun loadApps() {
+                  Thread {
+                      val pm = packageManager
+                      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val result = pm.queryIntentActivities(intent, 0)
+                          .map { AppItem(it.activityInfo.packageName, it.loadLabel(pm).toString()) }
+                          .filter { it.pkg != packageName }
+                          .distinctBy { it.pkg }
+                          .sortedBy { it.label.lowercase() }
+                      runOnUiThread {
+                          allApps = result
+                          applyFilter()
+                      }
+                  }.start()
+              }
+
+              inner class AppAdapter : BaseAdapter() {
+                  private val icons = HashMap<String, Drawable>()
+
+                  override fun getCount(): Int = shown.size
+                  override fun getItem(position: Int): Any = shown[position]
+                  override fun getItemId(position: Int): Long = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                      val row = convertView as? LinearLayout ?: makeRow()
+                      val item = shown[position]
+                      val iv = row.getChildAt(0) as ImageView
+                      val tv = row.getChildAt(1) as TextView
+                      val wifiBox = row.getChildAt(2) as CheckBox
+                      val dataBox = row.getChildAt(3) as CheckBox
+                      iv.setImageDrawable(icons.getOrPut(item.pkg) {
+                          try {
+                              packageManager.getApplicationIcon(item.pkg)
+                          } catch (e: Exception) {
+                              ColorDrawable(Color.TRANSPARENT)
+                          }
+                      })
+                      tv.text = item.label
+                      val c = this@MainActivity
+                      wifiBox.setOnCheckedChangeListener(null)
+                      dataBox.setOnCheckedChangeListener(null)
+                      wifiBox.isChecked = item.pkg in Prefs.blocked(c, true)
+                      dataBox.isChecked = item.pkg in Prefs.blocked(c, false)
+                      wifiBox.setOnCheckedChangeListener { _, checked -> setBlocked(item.pkg, true, checked) }
+                      dataBox.setOnCheckedChangeListener { _, checked -> setBlocked(item.pkg, false, checked) }
+                      return row
+                  }
+
+                  private fun makeRow(): LinearLayout {
+                      val c = this@MainActivity
+                      val row = LinearLayout(c)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      row.setPadding(c.dp(16), c.dp(6), c.dp(8), c.dp(6))
+                      row.addView(ImageView(c), LinearLayout.LayoutParams(c.dp(36), c.dp(36)))
+                      val tv = TextView(c)
+                      tv.textSize = 15f
+                      tv.setPadding(c.dp(12), 0, 0, 0)
+                      row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      val wifiBox = CheckBox(c)
+                      wifiBox.text = "WiFi"
+                      row.addView(wifiBox)
+                      val dataBox = CheckBox(c)
+                      dataBox.text = "Data"
+                      row.addView(dataBox)
+                      return row
+                  }
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/netblocker/Prefs.kt')"
+          cat > 'app/src/main/java/com/myapps/netblocker/Prefs.kt' <<'EOF_APPLOCK'
+          package com.myapps.netblocker
+
+          import android.content.Context
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+          /** Which apps are blocked on WiFi and which on mobile data. */
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("netblocker", Context.MODE_PRIVATE)
+              private fun key(wifi: Boolean) = if (wifi) "blocked_wifi" else "blocked_data"
+
+              fun blocked(c: Context, wifi: Boolean): Set<String> =
+                  sp(c).getStringSet(key(wifi), null)?.toSet() ?: emptySet()
+
+              fun setBlocked(c: Context, wifi: Boolean, pkg: String, block: Boolean) {
+                  val s = blocked(c, wifi).toMutableSet()
+                  if (block) s.add(pkg) else s.remove(pkg)
+                  sp(c).edit().putStringSet(key(wifi), s).apply()
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_block_fg.xml')"
+          cat > 'app/src/main/res/drawable/ic_block_fg.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <group
+                  android:scaleX="2.5"
+                  android:scaleY="2.5"
+                  android:translateX="24"
+                  android:translateY="24">
+                  <path
+                      android:fillColor="#FFFFFF"
+                      android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2zM4,12c0,-4.42 3.58,-8 8,-8 1.85,0 3.55,0.63 4.9,1.69L5.69,16.9C4.63,15.55 4,13.85 4,12zM12,20c-1.85,0 -3.55,-0.63 -4.9,-1.69L18.31,7.1C19.37,8.45 20,10.15 20,12c0,4.42 -3.58,8 -8,8z" />
+              </group>
+          </vector>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')"
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_block_fg" />
+          </adaptive-icon>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/values/colors.xml')"
+          cat > 'app/src/main/res/values/colors.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="icon_bg">#7A1F1F</color>
+          </resources>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Net Blocker</string>
+          </resources>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF_APPLOCK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_APPLOCK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF_APPLOCK'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NetBlocker"
+          include(":app")
+          EOF_APPLOCK
+          base64 -d > app/netblocker.jks <<'EOF_APPLOCK'
+          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
+          8gQUL/hNIyATbwo/P+45ZlGh4ivC4jICAicQ
+          EOF_APPLOCK
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build the APK
+        run: |
+          gradle assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk NetBlocker.apk
+
+      - name: Save APK (Actions tab)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetBlocker.apk
+          path: NetBlocker.apk
+
+      - name: Publish APK (Releases page)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: netblocker-${{ github.run_number }}
+          name: Net Blocker build ${{ github.run_number }}
+          files: NetBlocker.apk
